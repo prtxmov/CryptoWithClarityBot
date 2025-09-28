@@ -6,15 +6,23 @@ from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandle
 from flask import Flask, request, jsonify
 import threading
 import requests
+import json
+import base64
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad
 
 # ----------------- CONFIG -----------------
 BOT_TOKEN = "8467801272:AAGB5sy8q5CBp4ktLhPmTvCriF3d4t7vAbI"
 DATABASE = "db.sqlite3"
 MAXELPAY_API_KEY = "KU18KjYD8ajrAaEHQBnAByXFQEsJRYdp"
-RENDER_URL = "https://cryptowithclaritybot.onrender.com/webhook"  # webhook URL for MaxelPay
+MAXELPAY_SECRET_KEY = "Alwq2y1565E5u5vNVzEhViwVYOcfkj0c"
+WEBHOOK_URL = "https://cryptowithclaritybot.onrender.com/webhook"
 
 # ----------------- LOGGING -----------------
-logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
 
 # ----------------- DATABASE -----------------
 def init_db():
@@ -57,6 +65,31 @@ def update_subscription(user_id, plan, days):
     conn.commit()
     conn.close()
 
+# ----------------- MAXELPAY ENCRYPTION -----------------
+def encrypt_payload(payload):
+    key = MAXELPAY_SECRET_KEY.encode('utf-8')
+    cipher = AES.new(key[:32], AES.MODE_CBC, key[:16])
+    encrypted = cipher.encrypt(pad(payload.encode('utf-8'), AES.block_size))
+    return base64.b64encode(encrypted).decode('utf-8')
+
+def generate_payment_link(user_id, plan, amount, days):
+    payload = {
+        "orderID": f"{user_id}_{int(datetime.now().timestamp())}",
+        "amount": str(amount),
+        "currency": "USD",
+        "timestamp": str(int(datetime.now().timestamp())),
+        "userName": str(user_id),
+        "siteName": "CryptoWithClarity",
+        "userEmail": f"{user_id}@example.com",
+        "redirectUrl": WEBHOOK_URL,
+        "websiteUrl": "https://cryptowithclarity.in",
+        "cancelUrl": WEBHOOK_URL,
+        "webhookUrl": f"{WEBHOOK_URL}?user_id={user_id}&plan_days={days}&plan_name={plan}"
+    }
+    payload_json = json.dumps(payload)
+    encrypted = encrypt_payload(payload_json)
+    return f"https://checkout.maxelpay.com/invoice?data={encrypted}&api_key={MAXELPAY_API_KEY}"
+
 # ----------------- TELEGRAM BOT -----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -67,30 +100,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🌐 Public Community", url="https://t.me/+jUlj8kNrBRg2NGY9")],
         [InlineKeyboardButton("🛡️ Warroom", callback_data="warroom")],
         [InlineKeyboardButton("🎁 Airdrop Community", url="https://t.me/+qmz3WHjuvjcxYjM1")],
-        [InlineKeyboardButton("📞 Contact Support Team", url="https://t.me/CryptoWith_Sarvesh")],
-        [InlineKeyboardButton("💹 Start Trading", url="https://axiom.trade/@sarvesh")]
+        [InlineKeyboardButton("📩 Contact Support Team", url="https://t.me/CryptoWith_Sarvesh")],
+        [InlineKeyboardButton("📈 Start Trading", url="https://axiom.trade/@sarvesh")]
     ]
     keyboard = InlineKeyboardMarkup(buttons)
     await update.message.reply_text("Welcome to CryptoWithClarity Bot!", reply_markup=keyboard)
 
 async def warroom(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
+    user_id = update.effective_user.id
     user = get_user(user_id)
-
-    if not user or not user[2]:  # No subscription
+    if not user or not user[2]:  # subscription_plan
         buttons = [
-            [InlineKeyboardButton("💰 $10 / week", callback_data="sub_10")],
-            [InlineKeyboardButton("💵 $20 / month", callback_data="sub_20")],
-            [InlineKeyboardButton("🪙 $50 / 3 months", callback_data="sub_50")]
+            [InlineKeyboardButton("💵 $10 / week", callback_data="sub_10")],
+            [InlineKeyboardButton("💳 $20 / month", callback_data="sub_20")],
+            [InlineKeyboardButton("💰 $50 / 3 months", callback_data="sub_50")]
         ]
-        await query.message.reply_text(
+        await update.callback_query.message.reply_text(
             "Warroom is available for subscribed users only.\nChoose a plan to subscribe:",
             reply_markup=InlineKeyboardMarkup(buttons)
         )
     else:
-        perks = "🛡️ Warroom Perks:\n- 🤖 AI Prompts\n- ⚡ Bot Tools for Trades\n- 🌐 Exclusive Community Access"
-        await query.message.reply_text(perks)
+        perks = "Warroom Perks:\n- AI Prompts\n- Bot Tools for Trades\n- Exclusive Community Access"
+        await update.callback_query.message.reply_text(perks)
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -99,23 +130,21 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "sub_10":
         plan = "$10 / week"
-        amount = 10
         days = 7
+        amount = 10
     elif data == "sub_20":
         plan = "$20 / month"
-        amount = 20
         days = 30
+        amount = 20
     elif data == "sub_50":
         plan = "$50 / 3 months"
-        amount = 50
         days = 90
+        amount = 50
     else:
         return
 
-    # Generate MaxelPay payment link
-    payment_link = f"https://maxelpay.com/pay?api_key={MAXELPAY_API_KEY}&amount={amount}&callback_url={RENDER_URL}?user_id={user_id}&plan={days}"
-
-    await query.message.reply_text(f"💳 Payment link: {payment_link}\nAfter payment, your subscription will be activated.")
+    payment_link = generate_payment_link(user_id, plan, amount, days)
+    await query.message.reply_text(f"💳 Your payment link:\n{payment_link}\nAfter payment, your subscription will activate automatically.")
 
 # ----------------- HANDLERS -----------------
 app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -123,18 +152,21 @@ app_bot.add_handler(CommandHandler("start", start))
 app_bot.add_handler(CallbackQueryHandler(warroom, pattern="^warroom$"))
 app_bot.add_handler(CallbackQueryHandler(subscribe, pattern="^sub_"))
 
-# ----------------- FLASK WEBHOOK -----------------
+# ----------------- FLASK -----------------
 flask_app = Flask(__name__)
 
-@flask_app.route("/webhook", methods=["POST"])
+@flask_app.route("/webhook", methods=["POST", "GET"])
 def webhook():
-    data = request.json
-    user_id = data.get("user_id")
-    days = int(data.get("plan", 0))
-    if user_id and days:
-        update_subscription(user_id, f"{days}-day plan", days)
-        return jsonify({"status": "success", "message": "Subscription activated"})
-    return jsonify({"status": "failed", "message": "Invalid data"})
+    data = request.json or request.args
+    user_id = int(data.get("user_id", 0))
+    plan_name = data.get("plan_name", "")
+    plan_days = int(data.get("plan_days", 0))
+
+    if user_id and plan_name and plan_days:
+        update_subscription(user_id, plan_name, plan_days)
+        # Here you can also notify the user in Telegram
+        return jsonify({"status": "ok", "message": "Subscription activated"})
+    return jsonify({"status": "error", "message": "Invalid data"})
 
 def run_flask():
     flask_app.run(host="0.0.0.0", port=5000)
