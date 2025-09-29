@@ -1,83 +1,129 @@
-import os
-import json
 import logging
-import secrets
+import random
+import string
 import requests
+import asyncio
 from flask import Flask, request
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-API_KEY = os.getenv("MAXELPAY_API_KEY", "YOUR_MAXELPAY_API_KEY")
-SECRET_KEY = os.getenv("MAXELPAY_SECRET_KEY", "YOUR_MAXELPAY_SECRET_KEY")
+# --- Config ---
+BOT_TOKEN = "8467801272:AAGB5sy8q5CBp4ktLhPmTvCriF3d4t7vAbI"
 
+# Maxelpay API creds (replace with yours)
+MAXELPAY_API_KEY = "KU18KjYD8ajrAaEHQBnAByXFQEsJRYdp"
+MAXELPAY_SECRET_KEY = "Alwq2y1565E5u5vNVzEhViwVYOcfkj0c"
+
+# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
+# Flask app
+flask_app = Flask(__name__)
 
-# Telegram command: start
+# --- Bot Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Welcome! Use /buy10 /buy20 /buy50 to purchase a subscription.")
+    keyboard = [
+        [InlineKeyboardButton("🚀 Start Trading", url="https://axiom.trade/@sarvesh")],
+        [InlineKeyboardButton("💎 War Room", callback_data="warroom")],
+        [InlineKeyboardButton("🔑 Subscribe", callback_data="subscribe")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("👋 Welcome to *Crypto With Clarity Bot* 🚀", reply_markup=reply_markup, parse_mode="Markdown")
 
-# Generate payment link (dummy for testing)
-def generate_payment_link(amount, user_id):
-    return f"https://checkout.maxelpay.com/invoice?id=MX_INV_{amount}_{user_id}"
-
-async def buy10(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    link = generate_payment_link(10, user_id)
-    await update.message.reply_text(f"Pay $10 here: {link}")
-
-async def buy20(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    link = generate_payment_link(20, user_id)
-    await update.message.reply_text(f"Pay $20 here: {link}")
-
-async def buy50(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    link = generate_payment_link(50, user_id)
-    await update.message.reply_text(f"Pay $50 here: {link}")
-
-# Extra commands
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("/start - Welcome
-/buy10 - Buy $10 plan
-/buy20 - Buy $20 plan
-/buy50 - Buy $50 plan
-/earn - Info on earning
-/about - About this bot")
+    await update.message.reply_text(
+        """🤖 Here are the available commands:
 
-async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("This is a subscription bot powered by MaxelPay.")
+/start - Welcome 🎉
+/about - About the bot ℹ️
+/earn - Earn rewards 💰
+/help - Show this help message ❓
+/subscribe - Get subscription plans 🔑"""
+    )
 
-async def earn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("You can earn rewards by inviting friends!")
+async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        """ℹ️ About CryptoWithClarity Bot:
 
-# Flask webhook
-@app.route("/webhook", methods=["POST"])
-def webhook():
+This bot helps you explore crypto insights 🚀,
+earn rewards 💰, and subscribe 🔑 for premium access.
+
+Made to simplify crypto for everyone!"""
+    )
+
+async def earn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        """💰 Earn Menu:
+
+👉 Invite friends and earn rewards 🎉
+👉 Complete tasks and get bonuses 🔥
+👉 Join our community 🚀"""
+    )
+
+async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("💵 $10 Plan", callback_data="sub_10")],
+        [InlineKeyboardButton("💵 $20 Plan", callback_data="sub_20")],
+        [InlineKeyboardButton("💵 $50 Plan", callback_data="sub_50")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("🔑 Choose your subscription plan:", reply_markup=reply_markup)
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "warroom":
+        await query.edit_message_text("💎 *War Room Perks:*
+
+✅ AI Prompts
+✅ Bot Tools for Trades
+✅ Exclusive Market Insights 🚀", parse_mode="Markdown")
+
+    elif query.data.startswith("sub_"):
+        plan = query.data.split("_")[1]
+        amount = {"10": "10", "20": "20", "50": "50"}[plan]
+
+        # Generate fake dynamic link (replace with real API call later)
+        user_id = query.from_user.id
+        fake_link = f"https://checkout.maxelpay.com/invoice?id=MX_INV_{amount}_{user_id}"
+        await query.edit_message_text(f"💵 Subscription Plan Selected: ${amount}
+
+👉 [Pay Now]({fake_link})", parse_mode="Markdown")
+
+# --- Flask Webhook ---
+@flask_app.route('/webhook', methods=['POST'])
+def payment_webhook():
     data = request.json
-    logger.info(f"Webhook received: {data}")
+    logging.info(f"Payment Webhook: {data}")
     return {"status": "ok"}
 
+# --- Main ---
 def main():
-    application = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("buy10", buy10))
-    application.add_handler(CommandHandler("buy20", buy20))
-    application.add_handler(CommandHandler("buy50", buy50))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("about", about))
-    application.add_handler(CommandHandler("earn", earn))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("about", about_command))
+    app.add_handler(CommandHandler("earn", earn_command))
+    app.add_handler(CommandHandler("subscribe", subscribe))
+    app.add_handler(CallbackQueryHandler(button_handler))
 
-    # Start bot in background
-    import threading
-    threading.Thread(target=lambda: application.run_polling()).start()
+    # Run bot + Flask together
+    loop = asyncio.get_event_loop()
 
-    # Run Flask server
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    async def run_bot():
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling()
+        await app.updater.idle()
+
+    from threading import Thread
+    def run_flask():
+        flask_app.run(host="0.0.0.0", port=5000)
+
+    Thread(target=run_flask).start()
+    loop.run_until_complete(run_bot())
 
 if __name__ == "__main__":
     main()
