@@ -2,25 +2,28 @@ import logging
 import sqlite3
 import threading
 import requests
-import json
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 
-# ----------------- CONFIG -----------------
+# ---------------- CONFIG ----------------
 BOT_TOKEN = "8467801272:AAGB5sy8q5CBp4ktLhPmTvCriF3d4t7vAbI"
 DATABASE = "db.sqlite3"
-NOWPAYMENTS_API_KEY = "FG43MR3-RHPM8ZK-GCQ5VYD-SNCHJ3C"
-NOWPAYMENTS_IPN_SECRET = "hCtlqRpYс7rTkK5e9eZQDbv6MimGSZkC"
-# ------------------------------------------
+
+# NowPayments credentials
+NOWPAYMENTS_API_KEY = "FG43MR3-RHPM8ZK-GCQ5VYD-SNCHJ3C"  # api key
+IPN_SECRET = "hCtlqRpYс7rTkK5e9eZQDbv6MimGSZkC"          # ipn secret
+
+# Public URL of your Flask server (update with your domain or ngrok tunnel)
+PUBLIC_URL = "https://your-server.com"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 
-# ----------------- DATABASE -----------------
+# ---------------- DATABASE ----------------
 def init_db():
     conn = sqlite3.connect(DATABASE)
     c = conn.cursor()
@@ -30,10 +33,9 @@ def init_db():
             username TEXT,
             subscription_plan TEXT,
             subscription_end TEXT,
-            referral_id TEXT,
-            referred_by TEXT,
             referrals INTEGER DEFAULT 0,
-            commission REAL DEFAULT 0
+            commission REAL DEFAULT 0,
+            referred_by INTEGER
         )
     ''')
     conn.commit()
@@ -50,12 +52,10 @@ def get_user(user_id):
 def add_user(user_id, username, referred_by=None):
     conn = sqlite3.connect(DATABASE)
     c = conn.cursor()
-    referral_id = f"ref{user_id}"
-    c.execute("INSERT OR IGNORE INTO users (user_id, username, referral_id, referred_by) VALUES (?,?,?,?)",
-              (user_id, username, referral_id, referred_by))
+    c.execute("INSERT OR IGNORE INTO users (user_id, username, referred_by) VALUES (?,?,?)",
+              (user_id, username, referred_by))
     conn.commit()
     conn.close()
-    return referral_id
 
 def update_subscription(user_id, plan, days):
     end_date = datetime.now() + timedelta(days=days)
@@ -66,41 +66,54 @@ def update_subscription(user_id, plan, days):
     conn.commit()
     conn.close()
 
-def add_commission(referral_id, amount):
+def add_commission(referrer_id, amount):
     conn = sqlite3.connect(DATABASE)
     c = conn.cursor()
-    c.execute("UPDATE users SET commission = commission + ? WHERE referral_id=?", (amount, referral_id))
-    c.execute("UPDATE users SET referrals = referrals + 1 WHERE referral_id=?", (referral_id,))
+    c.execute("UPDATE users SET commission = commission + ? WHERE user_id=?",
+              (amount, referrer_id))
     conn.commit()
     conn.close()
 
-# ----------------- NOWPAYMENTS -----------------
+# ---------------- NOWPAYMENTS ----------------
 def generate_payment_link(user_id, plan, amount, days):
+    url = "https://api.nowpayments.io/v1/invoice"
+    headers = {
+        "x-api-key": NOWPAYMENTS_API_KEY,
+        "Content-Type": "application/json"
+    }
     payload = {
         "price_amount": amount,
         "price_currency": "usd",
-        "pay_currency": "usd",
         "order_id": f"{user_id}_{int(datetime.now().timestamp())}",
-        "ipn_callback_url": f"https://cryptowithsarveshbot.onrender.com/webhook?user_id={user_id}&plan={plan}&days={days}"
+        "order_description": f"{plan} subscription for {days} days",
+        "ipn_callback_url": f"{PUBLIC_URL}/ipn?user_id={user_id}&plan={plan}&days={days}",
+        "success_url": "https://t.me/cryptowithsarvesh_bot",
+        "cancel_url": "https://t.me/cryptowithsarvesh_bot"
     }
-    headers = {"x-api-key": NOWPAYMENTS_API_KEY, "Content-Type": "application/json"}
     try:
-        res = requests.post("https://api.nowpayments.io/v1/invoice", headers=headers, json=payload)
-        data = res.json()
-        if "invoice_url" in data:
-            return data["invoice_url"]
-        return "Error generating payment link"
+        res = requests.post(url, headers=headers, json=payload, timeout=20)
+        res_data = res.json()
+        logging.info(f"NowPayments response: {res_data}")
+        if "invoice_url" in res_data:
+            return res_data["invoice_url"]
+        else:
+            return "Error generating payment link"
     except Exception as e:
-        logging.error(f"NowPayments error: {e}")
+        logging.error(f"Payment link exception: {e}")
         return "Error generating payment link"
 
-# ----------------- TELEGRAM BOT -----------------
+# ---------------- TELEGRAM BOT ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username or ""
+
     referred_by = None
-    if update.message.text and "ref" in update.message.text:
-        referred_by = update.message.text.split("ref")[1]
+    if context.args and context.args[0].startswith("ref"):
+        try:
+            referred_by = int(context.args[0].replace("ref", ""))
+        except:
+            pass
+
     add_user(user_id, username, referred_by)
 
     buttons = [
@@ -114,14 +127,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🆘 Help", callback_data="help")]
     ]
     keyboard = InlineKeyboardMarkup(buttons)
-    await update.message.reply_text("🚀 Welcome to *CryptoWithClarity Bot*!\nChoose an option below:", reply_markup=keyboard, parse_mode="Markdown")
+    await update.message.reply_text(
+        "🚀 Welcome to *CryptoWithSarvesh Bot*!\nChoose an option below:",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
 
 async def warroom(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
     user = get_user(user_id)
 
-    if not user or not user[2]:
+    if not user or not user[2]:  # no subscription
         buttons = [
             [InlineKeyboardButton("💵 $10 / week", callback_data="sub_10")],
             [InlineKeyboardButton("💳 $20 / month", callback_data="sub_20")],
@@ -154,48 +171,57 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text(f"✅ Click below to complete payment:\n{payment_link}")
 
 async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.message.reply_text("ℹ️ *About Us:*\nCryptoWithClarity provides AI trading prompts, signals, and premium communities.", parse_mode="Markdown")
+    await update.callback_query.message.reply_text(
+        "ℹ️ *About Us:*\nCryptoWithSarvesh provides AI trading prompts, signals, and premium communities.",
+        parse_mode="Markdown"
+    )
 
 async def earn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.callback_query.from_user.id
-    user = get_user(user_id)
-    referral_id = user[4] if user else f"ref{user_id}"
+    referral_link = f"https://t.me/cryptowithsarvesh_bot?start=ref{user_id}"
     await update.callback_query.message.reply_text(
-        f"💰 *Earn Program:*\nInvite friends and earn referral commissions!\nYour referral link: https://t.me/cryptowithsarvesh_bot?start={referral_id}",
+        f"💰 *Earn Program:*\nInvite friends and earn referral commissions!\nYour referral link: {referral_link}",
         parse_mode="Markdown"
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.message.reply_text("🆘 *Help Menu:*\n- For support: @CryptoWith_Sarvesh\n- Payment Issues: Contact support\n- General Queries: Use /start", parse_mode="Markdown")
+    await update.callback_query.message.reply_text(
+        "🆘 *Help Menu:*\n- For support: @CryptoWith_Sarvesh\n- Payment Issues: Contact support\n- General Queries: Use /start",
+        parse_mode="Markdown"
+    )
 
-# ----------------- FLASK -----------------
+# ---------------- FLASK ----------------
 flask_app = Flask(__name__)
 
-@flask_app.route("/webhook", methods=["POST"])
-def webhook():
-    ipn_secret = request.headers.get("x-nowpayments-ipn-secret")
-    if ipn_secret != NOWPAYMENTS_IPN_SECRET:
-        return jsonify({"status": "error", "message": "Invalid IPN secret"}), 403
-
+@flask_app.route("/ipn", methods=["POST"])
+def ipn_listener():
     data = request.json
-    user_id = request.args.get("user_id")
-    plan = request.args.get("plan")
-    days = int(request.args.get("days", 0))
-    logging.info(f"IPN received for user {user_id}, plan {plan}, days {days}")
+    logging.info(f"IPN Received: {data}")
 
-    if user_id and plan and days > 0:
-        update_subscription(user_id, plan, days)
-        # Add referral commission if user was referred
-        user = get_user(int(user_id))
-        if user and user[5]:
-            add_commission(user[5], 0.25 * days)
-        return jsonify({"status": "success", "message": "Subscription updated"})
-    return jsonify({"status": "error", "message": "Invalid data"})
+    try:
+        user_id = int(request.args.get("user_id"))
+        plan = request.args.get("plan")
+        days = int(request.args.get("days", 0))
+
+        if data.get("payment_status") == "finished":
+            update_subscription(user_id, plan, days)
+
+            # handle referral commission
+            user = get_user(user_id)
+            referred_by = user[6] if user else None
+            if referred_by:
+                commission = 0.25 * float(data.get("price_amount", 0))
+                add_commission(referred_by, commission)
+
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        logging.error(f"IPN error: {e}")
+        return jsonify({"status": "error", "message": str(e)})
 
 def run_flask():
     flask_app.run(host="0.0.0.0", port=5000)
 
-# ----------------- MAIN -----------------
+# ---------------- MAIN ----------------
 def main():
     init_db()
     threading.Thread(target=run_flask, daemon=True).start()
