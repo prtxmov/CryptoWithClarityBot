@@ -5,11 +5,12 @@ Telegram bot + NowPayments IPN + Admin backend (Flask)
 Admin login: admin / prtxsarveshadmin811994
 Admin panel at /admin -> /dashboard
 
-Features added:
-- Notify user via Telegram when IPN marks payment finished.
-- Universal message handler: nudges unpaid users when they message the bot (rate-limited once per 24h).
-- Admin dashboard: "Resend Activation" button to resend activation messages.
-- DB migrations: adds last_notified column and invoices table.
+Features:
+- Auto-attempt activation when user is redirected to /success after payment (checks NowPayments API).
+- IPN (/ipn) remains authoritative and also triggers activation + Telegram notification.
+- Sends Warroom link on successful activation.
+- Nudges unpaid users once per 24 hours when they message the bot.
+- Admin dashboard includes resend activation and basic invoice tracking.
 """
 
 import logging
@@ -32,7 +33,7 @@ DATABASE = "db.sqlite3"
 NOWPAYMENTS_API_KEY = "FG43MR3-RHPM8ZK-GCQ5VYD-SNCHJ3C"
 NOWPAYMENTS_IPN_SECRET = "hCtlqRpYс7rTkK5e9eZQDbv6MimGSZkC"
 
-# Replace with your public URL (Render domain). Used when creating invoices.
+# Replace with your public URL (Render domain). Used when creating invoices and success/cancel callbacks.
 PUBLIC_URL = "https://your-deployed-app.onrender.com"
 
 # Admin credentials (as requested)
@@ -60,8 +61,8 @@ logger = logging.getLogger(__name__)
 # Global telegram bot (set in main)
 TELEGRAM_BOT = None
 
-# Default warroom link you provided earlier
-DEFAULT_WARROOM_LINK = "https://t.me/+jUlj8kNrBRg2NGY9"
+# YOUR WARROOM LINK (as you provided)
+DEFAULT_WARROOM_LINK = "https://t.me/+IM_nIsf78JI4NzI1"
 
 # ----------------- DATABASE UTILITIES -----------------
 def init_db():
@@ -83,19 +84,16 @@ def init_db():
     ''')
     conn.commit()
     # Ensure optional columns exist (migrations)
-    # Add referral_id column if missing (kept for compatibility)
     try:
         c.execute("ALTER TABLE users ADD COLUMN referral_id TEXT")
     except sqlite3.OperationalError:
         pass
-
-    # Ensure last_notified exists (safeguard for older DBs)
     try:
         c.execute("ALTER TABLE users ADD COLUMN last_notified TEXT")
     except sqlite3.OperationalError:
         pass
 
-    # Create invoices table for future use / tracking
+    # Create invoices table for tracking
     c.execute('''
         CREATE TABLE IF NOT EXISTS invoices (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -130,10 +128,8 @@ def get_user_by_username(username):
 
 def add_user(user_id, username, referred_by=None):
     referral_id = f"ref{user_id}"
-    # Insert if not exists
     query_db("INSERT OR IGNORE INTO users (user_id, username, referred_by, referral_id) VALUES (?,?,?,?)",
              (user_id, username, referred_by, referral_id))
-    # ensure referral_id is present (for older rows)
     query_db("UPDATE users SET referral_id=? WHERE user_id=? AND (referral_id IS NULL OR referral_id='')",
              (referral_id, user_id))
     return referral_id
@@ -148,12 +144,10 @@ def set_subscription_end(user_id, end_datetime):
     query_db("UPDATE users SET subscription_end=? WHERE user_id=?", (end_datetime, user_id))
 
 def add_commission_to(referral_id_or_userid, amount):
-    # try by referral_id first
     res = query_db("SELECT * FROM users WHERE referral_id=?", (referral_id_or_userid,), one=True)
     if res:
         query_db("UPDATE users SET commission = commission + ? WHERE referral_id=?", (amount, referral_id_or_userid))
         return True
-    # try by numeric user_id
     try:
         uid = int(referral_id_or_userid)
         query_db("UPDATE users SET commission = commission + ? WHERE user_id=?", (amount, uid))
@@ -206,22 +200,25 @@ def generate_payment_link(user_id, plan_key):
         "price_currency": "usd",
         "order_id": order_id,
         "order_description": f"{plan['label']} subscription for user {user_id}",
+        # success_url points back to our app so we can try to auto-activate on redirect
         "ipn_callback_url": f"{PUBLIC_URL}/ipn?user_id={user_id}&plan={plan_key}&days={days}",
-        "success_url": f"https://t.me/cryptowithsarvesh_bot",
-        "cancel_url": f"https://t.me/cryptowithsarvesh_bot"
+        "success_url": f"{PUBLIC_URL}/success?order_id={order_id}&user_id={user_id}&plan={plan_key}",
+        "cancel_url": f"{PUBLIC_URL}/cancel?order_id={order_id}&user_id={user_id}"
     }
     headers = {"x-api-key": NOWPAYMENTS_API_KEY, "Content-Type": "application/json"}
     try:
         r = requests.post(NOWPAYMENTS_INVOICE_URL, headers=headers, json=payload, timeout=20)
         data = r.json()
         logger.info("NowPayments create invoice response: %s", json.dumps(data))
-        if "invoice_url" in data:
-            invoice_url = data["invoice_url"]
-            # Save basic invoice info
-            try:
-                save_invoice(order_id, user_id, plan_key, invoice_url, amount, status="pending")
-            except Exception:
-                logger.exception("Failed to save invoice to DB")
+        invoice_url = data.get("invoice_url") or data.get("payment_url") or None
+        # Try to capture invoice/payment id if provided
+        invoice_id = data.get("id") or data.get("payment_id") or data.get("invoice_id")
+        # Save basic invoice info (order_id is our generated id)
+        try:
+            save_invoice(order_id, user_id, plan_key, invoice_url or "", amount, status=data.get("status", "pending"))
+        except Exception:
+            logger.exception("Failed to save invoice to DB")
+        if invoice_url:
             return invoice_url, None
         return None, data.get("error", "Unknown error from NowPayments")
     except Exception as e:
@@ -261,7 +258,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             referred_by = arg
     add_user(user_id, username, referred_by)
     buttons = [
-        [InlineKeyboardButton("🌍 Public Community", url="https://t.me/+jUlj8kNrBRg2NGY9")],
+        [InlineKeyboardButton("🌍 Public Community", url=DEFAULT_WARROOM_LINK)],
         [InlineKeyboardButton("🔥 Warroom", callback_data="warroom")],
         [InlineKeyboardButton("🎁 Airdrop Community", url="https://t.me/+qmz3WHjuvjcxYjM1")],
         [InlineKeyboardButton("📞 Support Team", url="https://t.me/CryptoWith_Sarvesh")],
@@ -336,11 +333,9 @@ async def any_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     row = get_user(user_id)
     subscribed = False
     if row and row[2]:  # column 2 = subscription_plan
-        # Optionally check expiry
         try:
             sub_end = row[3]
             if sub_end:
-                # parse date and see if expired
                 end_dt = datetime.strptime(sub_end, "%Y-%m-%d %H:%M:%S")
                 if end_dt > datetime.utcnow():
                     subscribed = True
@@ -349,10 +344,8 @@ async def any_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             else:
                 subscribed = False
         except Exception:
-            # If parse fails, treat as subscribed if subscription_plan exists
             subscribed = True
 
-    # If not subscribed, send a one-line urgent notification, but only once per 24h
     if not subscribed:
         last = get_last_notified(user_id)
         now = datetime.utcnow()
@@ -371,11 +364,9 @@ async def any_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
                     "You are not a subscriber yet. Join the Warroom now or miss a big opportunity.\n\n"
                     f"Join here: {warroom_link}"
                 )
-                # Reply to user's message
                 if update.message:
                     await update.message.reply_text(text, parse_mode="Markdown")
                 else:
-                    # fallback to bot.send_message
                     global TELEGRAM_BOT
                     if TELEGRAM_BOT:
                         TELEGRAM_BOT.send_message(chat_id=user_id, text=text, parse_mode="Markdown")
@@ -383,7 +374,7 @@ async def any_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             except Exception:
                 logger.exception("Failed to send unpaid notification to %s", user_id)
 
-# ----------------- FLASK IPN -----------------
+# ----------------- FLASK IPN & Redirect HANDLING -----------------
 @flask_app.route("/ipn", methods=["POST"])
 def ipn_listener():
     logger.info("IPN received, headers=%s", dict(request.headers))
@@ -422,7 +413,6 @@ def ipn_listener():
                     user_id = None
 
                 if user_id:
-                    # Determine plan label & days
                     if plan_key in PLANS:
                         plan_label = PLANS[plan_key]["label"]
                         plan_days = PLANS[plan_key]["days"]
@@ -441,7 +431,6 @@ def ipn_listener():
                             add_commission_to(referred_by, commission_amount)
                             increase_referrals(referred_by)
 
-                    # If we have order_id, update invoice status
                     try:
                         if order_id:
                             update_invoice_status(order_id, "paid")
@@ -459,7 +448,6 @@ def ipn_listener():
 
             return jsonify({"status": "ignored", "reason": "no user_id"}), 200
 
-        # for non-final statuses, optionally update invoice record
         try:
             if order_id:
                 update_invoice_status(order_id, status or "pending")
@@ -471,6 +459,79 @@ def ipn_listener():
     except Exception as e:
         logger.exception("IPN processing error")
         return jsonify({"status": "error", "message": str(e)}), 500
+
+@flask_app.route("/success")
+def success_redirect():
+    """
+    Handle redirects from NowPayments success_url.
+    We try to verify the invoice status via NowPayments API and, if paid,
+    activate the subscription and notify the user immediately.
+    If verification fails, we tell the user the payment is pending and rely on IPN.
+    """
+    order_id = request.args.get("order_id")
+    user_id = request.args.get("user_id")
+    plan_key = request.args.get("plan")
+
+    if not order_id:
+        return "Missing order_id", 400
+
+    status = None
+    headers = {"x-api-key": NOWPAYMENTS_API_KEY}
+
+    # Try invoice endpoint first (some API versions expose invoice endpoint)
+    try:
+        r = requests.get(f"https://api.nowpayments.io/v1/invoice/{order_id}", headers=headers, timeout=10)
+        if r.status_code == 200:
+            d = r.json()
+            status = d.get("status") or d.get("payment_status") or d.get("invoice_status")
+    except Exception:
+        logger.debug("invoice endpoint check failed for order %s", order_id)
+
+    # Try payment endpoint
+    if not status:
+        try:
+            r = requests.get(f"https://api.nowpayments.io/v1/payment/{order_id}", headers=headers, timeout=10)
+            if r.status_code == 200:
+                d = r.json()
+                status = d.get("status")
+        except Exception:
+            logger.debug("payment endpoint check failed for order %s", order_id)
+
+    # Fallback: check our invoices table
+    try:
+        inv = query_db("SELECT status FROM invoices WHERE order_id=?", (order_id,), one=True)
+        if inv and inv[0]:
+            status = status or inv[0]
+    except Exception:
+        logger.exception("failed to read invoice from DB")
+
+    logger.info("Success redirect: order=%s status=%s", order_id, status)
+
+    if status and str(status).lower() in ("finished", "successful", "paid"):
+        try:
+            uid = int(user_id) if user_id else None
+        except Exception:
+            uid = None
+
+        if uid:
+            try:
+                if plan_key in PLANS:
+                    update_subscription(uid, PLANS[plan_key]["label"], PLANS[plan_key]["days"])
+                else:
+                    update_subscription(uid, plan_key or "Unknown", 0)
+                notify_user_subscription_activated(uid, PLANS[plan_key]["label"] if plan_key in PLANS else (plan_key or "Membership"))
+            except Exception:
+                logger.exception("failed to auto-activate subscription for %s", uid)
+
+        try:
+            update_invoice_status(order_id, "paid")
+        except Exception:
+            logger.exception("failed to update invoice status for %s", order_id)
+
+        return redirect("https://t.me/cryptowithsarvesh_bot")
+
+    return ("Payment not confirmed yet. If you just paid, please wait a few moments "
+            "for network confirmations — your subscription will be activated automatically once the payment is confirmed."), 200
 
 # ----------------- ADMIN PAGES -----------------
 def admin_login_page(msg=""):
@@ -663,7 +724,6 @@ def admin_resend_activation():
                 logger.exception("Failed to resend activation")
                 return redirect("/dashboard")
         else:
-            # If user not subscribed, just redirect with message
             return dashboard_page(list_users(500), msg="User has no subscription to resend.")
     except Exception:
         logger.exception("resend activation error")
