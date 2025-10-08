@@ -26,7 +26,7 @@ NOWPAYMENTS_API_KEY = "FG43MR3-RHPM8ZK-GCQ5VYD-SNCHJ3C"
 NOWPAYMENTS_IPN_SECRET = "hCtlqRpYс7rTkK5e9eZQDbv6MimGSZkC"
 
 # PUBLIC_URL must be your server domain (used to build ipn + success callbacks)
-PUBLIC_URL = "https://your-deploy-domain.onrender.com"
+PUBLIC_URL = "https://cryptowithclaritybot.onrender.com"
 
 # Admin credentials
 ADMIN_USERNAME = "admin"
