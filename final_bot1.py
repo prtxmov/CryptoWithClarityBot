@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# final_bot_admin.py
+# final_bot1.py
 """
 Env-var driven Telegram + NowPayments + Flask admin app.
 Reads secrets from environment variables (safer than hard-coding).
@@ -235,8 +235,6 @@ async def any_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             subscribed = True
     if not subscribed:
-        last = get_last_notified = None
-        # Use functions only if defined (they are above)
         try:
             last = get_last_notified(user.id)
         except Exception:
@@ -328,7 +326,6 @@ def success_redirect():
     status = None
     headers = {"x-api-key": NOWPAYMENTS_API_KEY}
 
-    # try to verify via known endpoints
     try:
         r = requests.get(f"https://api.nowpayments.io/v1/invoice/{order_id}", headers=headers, timeout=10)
         if r.status_code == 200:
@@ -343,8 +340,8 @@ def success_redirect():
             if r.status_code == 200:
                 d = r.json()
                 status = d.get("status")
-    except Exception:
-        logger.debug("payment endpoint failed for %s", order_id)
+        except Exception:
+            logger.debug("payment endpoint failed for %s", order_id)
 
     inv = find_invoice(order_id)
     if not status and inv and inv[5]:
@@ -372,7 +369,6 @@ def success_redirect():
                 logger.exception("activation on success failed")
         return redirect(WARROOM_LINK)
     else:
-        # not yet confirmed, but redirect for UX and send provisional message
         try:
             uid = int(user_id_q) if user_id_q else (inv[2] if inv else None)
             if uid:
