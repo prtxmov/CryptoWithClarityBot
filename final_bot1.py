@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # final_bot1.py — Render + Flask 3.x safe, Telegram via HTTP (no async), NowPayments flow
-# Updated: Referral commission 25% + admin panel to view/manage pending withdrawals
+# Updated: Added referral link generation, commission tracking, extend-with-commission, withdraw flow (SOL payouts)
 
 import os, json, logging, sqlite3, time, requests, urllib.parse
 from datetime import datetime, timedelta
@@ -145,12 +145,6 @@ def mark_withdrawal_ready(withdrawal_id):
 def deduct_commission(user_id, amount):
     qdb("UPDATE users SET commission = commission - ? WHERE user_id=?", (amount, user_id))
 
-def list_pending_withdrawals():
-    return qdb("SELECT w.id, w.user_id, u.username, w.amount, w.sol_address, w.status, w.created_at FROM withdrawals w LEFT JOIN users u ON u.user_id = w.user_id WHERE w.status IN ('awaiting_address','pending') ORDER BY w.created_at DESC")
-
-def update_withdrawal_status(withdrawal_id, status):
-    qdb("UPDATE withdrawals SET status=? WHERE id=?", (status, withdrawal_id))
-
 # ---------------- Telegram HTTP helpers ----------------
 def tg_send(method, payload):
     try:
@@ -194,9 +188,10 @@ def send_main_menu(chat_id):
         [btn("🎁 Airdrop Community", url="https://t.me/+qmz3WHjuvjcxYjM1")],
         [btn("📞 Support Team", url="https://t.me/CryptoWith_Sarvesh")],
         [btn("💹 Start Trading", url="https://axiom.trade/@sarvesh")],
-        [btn("ℹ️ About", cb="about")],
+        # About button removed per your request
         [btn("💰 Earn", cb="earn")],
-        [btn("🆘 Help", cb="help")]
+        # Help now links to the CWShelp chat
+        [btn("🆘 Help", url="https://t.me/CWShelp")]
     ])
     tg_send_message(chat_id,
         "🚀 Welcome to *CryptoWithSarvesh Bot*!\nChoose an option below:",
@@ -291,7 +286,9 @@ def telegram_webhook():
                 tg_send_message(cid, "⚠️ Please send a valid SOL address.")
                 return jsonify({"ok": True})
             # finalize withdrawal
+            withdrawal_id = pending[0] if isinstance(pending, (list, tuple)) else None
             # pending returned as a row: (id, user_id, amount, sol_address, status, created_at)
+            # Use indexing robustly:
             wid = pending[0]
             amount = pending[2]
             finalize_withdrawal(wid, sol_address)
@@ -352,7 +349,7 @@ def telegram_webhook():
                 u = get_user(cid)
                 refid = (u[7] if u else f"ref{cid}")
                 comm = (u[5] if u else 0.0)
-                # Build Earn UI with actions: Referral Link, Extend with commission, Withdraw
+                # Build Earn UI with actions: Referral Link, Extend with commission, Withdraw (if >=100)
                 rows = [
                     [btn("🔗 Referral Link", cb="ref_link")],
                     [btn("↗️ Extend with commission", cb="extend")],
@@ -379,7 +376,20 @@ def telegram_webhook():
             else:
                 # fallback to general public url (less ideal)
                 ref_link = f"{PUBLIC_URL.rstrip('/')}/start?ref={refid}"
-            tg_send_message(cid, f"🔗 Your referral link:\n{ref_link}\n\nShare this with friends. When they subscribe, you earn a commission.", parse_mode="Markdown")
+
+            # Build a friendly share message
+            share_text = f"Join the Warroom: {ref_link}"
+            encoded = urllib.parse.quote_plus(share_text)
+
+            keyboard = kb_inline([
+                # direct link button (opens the link in client)
+                [btn("🔗 Open Link", url=ref_link)],
+                # share via Telegram (pre-filled message)
+                [btn("📤 Share via Telegram", url=f"https://t.me/share/url?url=&text={encoded}")],
+                [btn("🏠 Main Menu", cb="menu")]
+            ])
+
+            tg_send_message(cid, f"🔗 Your referral link:\n{ref_link}\n\nShare this with friends. When they subscribe, you'll earn commission.", reply_markup=keyboard, parse_mode="Markdown")
             return jsonify({"ok": True})
 
         # extend using commission - show plan choices but for extend action
@@ -468,8 +478,8 @@ def ipn():
                 ref_user = get_user_by_referral_id(referred_by)
                 if ref_user:
                     ref_user_id = ref_user[0]
-                    # commission rate — set 25% of plan amount (updated)
-                    commission_amt = round(float(plan_amount) * 0.25, 2)
+                    # commission rate — set 10% of plan amount
+                    commission_amt = round(float(plan_amount) * 0.10, 2)
                     if commission_amt > 0:
                         add_commission_to_user(ref_user_id, commission_amt)
                         increment_referrals(ref_user_id)
@@ -518,112 +528,16 @@ def admin_login_page(msg=""):
     </body></html>
     """
 
-def admin_withdrawals_table():
-    rows = list_pending_withdrawals()
-    # Build simple HTML table
-    html_rows = ""
-    for r in rows:
-        wid, uid, uname, amount, sol, status, created_at = r
-        uname_disp = escape(uname) if uname else escape(str(uid))
-        sol_disp = escape(sol) if sol else ""
-        html_rows += f"""
-        <tr>
-          <td>{wid}</td>
-          <td>{uid}</td>
-          <td>@{uname_disp}</td>
-          <td>${amount:.2f}</td>
-          <td>{sol_disp}</td>
-          <td>{escape(status)}</td>
-          <td>{escape(created_at)}</td>
-          <td>
-            <form style="display:inline" method="post" action="/admin/withdrawals?action=mark_paid&id={wid}">
-              <button type="submit">Mark as Paid</button>
-            </form>
-            <form style="display:inline" method="post" action="/admin/withdrawals?action=reject&id={wid}">
-              <button type="submit">Reject</button>
-            </form>
-          </td>
-        </tr>
-        """
-    if not html_rows:
-        html_rows = "<tr><td colspan='8'>No pending withdrawals</td></tr>"
-    return f"""
-    <h3>Pending Withdrawals</h3>
-    <table border="1" cellpadding="6" cellspacing="0">
-      <thead>
-        <tr>
-          <th>ID</th><th>User ID</th><th>Username</th><th>Amount</th><th>SOL Address</th><th>Status</th><th>Created At</th><th>Actions</th>
-        </tr>
-      </thead>
-      <tbody>
-        {html_rows}
-      </tbody>
-    </table>
-    """
-
 @app.route("/admin", methods=["GET", "POST"])
 def admin():
-    # preserve the login page behavior
-    if request.method == "POST" and not session.get("admin"):
+    if request.method == "POST":
         if request.form.get("username") == ADMIN_USERNAME and request.form.get("password") == ADMIN_PASSWORD:
             session["admin"] = True
             return redirect("/admin")
         return admin_login_page("Invalid credentials")
     if not session.get("admin"):
         return admin_login_page()
-    # If admin, render panel with pending withdrawals
-    panel = "<html><head><title>Admin Panel</title></head><body>"
-    panel += "<h2>Admin logged in</h2>"
-    panel += admin_withdrawals_table()
-    panel += "<p><a href='/admin/logout'>Logout</a></p>"
-    panel += "</body></html>"
-    return panel
-
-@app.route("/admin/logout")
-def admin_logout():
-    session.pop("admin", None)
-    return redirect("/admin")
-
-@app.route("/admin/withdrawals", methods=["POST"])
-def admin_withdrawal_actions():
-    if not session.get("admin"):
-        return admin_login_page("Please login"), 403
-    action = request.args.get("action", "")
-    wid = request.args.get("id")
-    if not wid:
-        return "Missing id", 400
-    try:
-        wid_int = int(wid)
-    except:
-        return "Invalid id", 400
-    if action == "mark_paid":
-        # mark as paid
-        update_withdrawal_status(wid_int, "paid")
-        # optionally notify user
-        w = qdb("SELECT user_id, amount FROM withdrawals WHERE id=?", (wid_int,), one=True)
-        if w:
-            uid = w[0]
-            amt = w[1]
-            try:
-                tg_send_message(uid, f"✅ Your withdrawal request of ${amt:.2f} has been marked as PAID by admin.")
-            except Exception:
-                logger.exception("Failed to notify user about paid withdrawal")
-        return redirect("/admin")
-    if action == "reject":
-        # mark as rejected and refund commission back to user
-        w = qdb("SELECT user_id, amount FROM withdrawals WHERE id=?", (wid_int,), one=True)
-        if w:
-            uid = w[0]
-            amt = w[1]
-            update_withdrawal_status(wid_int, "rejected")
-            # refund commission
-            add_commission_to_user(uid, amt)
-            try:
-                tg_send_message(uid, f"❌ Your withdrawal request of ${amt:.2f} was rejected by admin. The amount has been returned to your commission balance.")
-            except Exception:
-                logger.exception("Failed to notify user about rejected withdrawal")
-        return redirect("/admin")
-    return "Unknown action", 400
+    return "<h2>Admin logged in</h2>"
 
 # ---------------- BOOTSTRAP ON IMPORT ----------------
 def _bootstrap():
