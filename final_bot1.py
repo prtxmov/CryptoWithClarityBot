@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # final_bot1.py — Render + Flask 3.x safe, Telegram via HTTP (no async), NowPayments flow
-# Updated: Added random referral ids, 25% commission, improved referral link generation,
-# and admin panel with Payouts / Subscribers / Referral tracker + activation/extend actions.
+# Updated: random referral ids, 25% commission, invoice tracking, admin invoices/payouts/subscribers/referrals
 
 import os, json, logging, sqlite3, time, requests, urllib.parse, uuid, secrets
 from datetime import datetime, timedelta
@@ -30,11 +29,10 @@ app.secret_key = os.getenv("FLASK_SECRET", "replace-me")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("bot")
 
-# Bot username (will be fetched at startup). Provide your bot name so links are reliably created.
-# (Do NOT include the leading @) — set to your bot username to ensure link generation works.
+# Use exact bot username with underscore as requested (no leading @)
 BOT_USERNAME = os.getenv("BOT_USERNAME", "cryptowithsarvesh_bot")
 
-# Commission rate (25% as requested)
+# Commission rate (25%)
 COMMISSION_RATE = 0.25
 
 PLANS = {
@@ -73,7 +71,6 @@ def init_db():
             created_at TEXT
         )
     """)
-    # track withdraw requests
     c.execute("""
         CREATE TABLE IF NOT EXISTS withdrawals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,27 +95,18 @@ def qdb(query, args=(), one=False):
     return (rows[0] if rows else None) if one else rows
 
 def _generate_unique_referral_id():
-    # generate ref_<8 hex> and ensure uniqueness
     for _ in range(5):
         rid = "ref_" + uuid.uuid4().hex[:8]
         existing = qdb("SELECT 1 FROM users WHERE referral_id=?", (rid,), one=True)
         if not existing:
             return rid
-    # fallback deterministic
     return f"ref_{secrets.token_hex(4)}"
 
 def add_user(user_id, username, referred_by=None):
-    """
-    Adds a user if missing. Generates a unique random referral_id for each user unless they already have one.
-    - preserves existing data for current users (so code updates won't reset subscriptions).
-    """
-    # Check if user exists
     existing = qdb("SELECT * FROM users WHERE user_id=?", (user_id,), one=True)
     if existing:
-        # update username and referred_by if present (don't overwrite referral_id)
         qdb("UPDATE users SET username=?, referred_by=? WHERE user_id=?", (username, referred_by or existing[6], user_id))
-        return existing[7]  # existing referral_id
-    # create new referral id
+        return existing[7]
     refid = _generate_unique_referral_id()
     qdb("INSERT INTO users (user_id, username, referred_by, referral_id) VALUES (?,?,?,?)",
         (user_id, username, referred_by, refid))
@@ -140,9 +128,6 @@ def is_subscribed(user_id):
         return False
 
 def update_subscription(user_id, plan_label, days):
-    """
-    Extends/sets subscription_end by `days` from now (UTC).
-    """
     end = (datetime.utcnow() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     qdb("UPDATE users SET subscription_plan=?, subscription_end=? WHERE user_id=?", (plan_label, end, user_id))
 
@@ -172,7 +157,7 @@ def mark_withdrawal_processed(withdrawal_id):
 def deduct_commission(user_id, amount):
     qdb("UPDATE users SET commission = commission - ? WHERE user_id=?", (amount, user_id))
 
-# ---------------- Telegram HTTP helpers ----------------
+# ---------------- Telegram helpers ----------------
 def tg_send(method, payload):
     try:
         r = requests.post(f"{TG_API}/{method}", json=payload, timeout=15)
@@ -216,9 +201,7 @@ def send_main_menu(chat_id):
         [btn("💰 Earn", cb="earn")],
         [btn("🆘 Help", url="https://t.me/CWShelp")]
     ])
-    tg_send_message(chat_id,
-        "🚀 Welcome to *CryptoWithSarvesh Bot*!\nChoose an option below:",
-        reply_markup=keyboard, parse_mode="Markdown")
+    tg_send_message(chat_id, "🚀 Welcome to *CryptoWithSarvesh Bot*!\nChoose an option below:", reply_markup=keyboard, parse_mode="Markdown")
 
 def generate_payment_link(user_id, plan_key):
     if plan_key not in PLANS:
@@ -250,9 +233,7 @@ def generate_payment_link(user_id, plan_key):
 def ensure_webhook():
     url = f"{PUBLIC_URL.rstrip('/')}/telegram_webhook"
     try:
-        r = requests.post(f"{TG_API}/setWebhook",
-                          data={"url": url, "drop_pending_updates": "true"},
-                          timeout=10)
+        r = requests.post(f"{TG_API}/setWebhook", data={"url": url, "drop_pending_updates": "true"}, timeout=10)
         logger.info("setWebhook -> %s %s", r.status_code, r.text)
     except Exception:
         logger.exception("setWebhook failed")
@@ -283,14 +264,13 @@ def telegram_webhook():
     data = request.get_json(force=True, silent=True) or {}
     logger.info("INCOMING TELEGRAM UPDATE: %s", json.dumps(data))
 
-    # handle messages (text replies including SOL addresses for withdrawals)
     if "message" in data:
         msg = data["message"]
         text = msg.get("text", "")
         cid = msg["chat"]["id"]
         uname = msg.get("from", {}).get("username", "")
 
-        # START handling (deep-link referral)
+        # START (deep-link referral)
         if text and text.startswith("/start"):
             parts = text.split()
             ref = None
@@ -300,7 +280,7 @@ def telegram_webhook():
             send_main_menu(cid)
             return jsonify({"ok": True})
 
-        # If user has a pending withdrawal awaiting SOL address, treat their next message as SOL address
+        # handle pending withdrawal SOL address
         pending = get_pending_withdrawal(cid)
         if pending:
             sol_address = text.strip()
@@ -323,21 +303,16 @@ def telegram_webhook():
             tg_send_message(cid, "✅ Withdrawal request prepared. Use the buttons below to send the payout request to the payout channel/team.", reply_markup=keyboard)
             return jsonify({"ok": True})
 
-    # handle callback_query (button presses)
     if "callback_query" in data:
         cq = data["callback_query"]
         cid = cq["from"]["id"]
         payload = cq.get("data", "")
         uname = cq["from"].get("username", "")
 
-        # WARROOM flow (existing)
         if payload == "warroom":
             if is_subscribed(cid):
-                tg_send_message(
-                    cid,
-                    "🎟️ You are already subscribed! Use Earn to extend.",
-                    reply_markup=kb_inline([[btn("💰 Earn", cb="earn")], [btn("🏠 Main Menu", cb="menu")]])
-                )
+                tg_send_message(cid, "🎟️ You are already subscribed! Use Earn to extend.",
+                                reply_markup=kb_inline([[btn("💰 Earn", cb="earn")], [btn("🏠 Main Menu", cb="menu")]]))
             else:
                 plans = kb_inline([
                     [btn("💵 $10 / week", cb="sub_10")],
@@ -348,7 +323,6 @@ def telegram_webhook():
                 tg_send_message(cid, "⚡ Choose a subscription plan:", reply_markup=plans)
             return jsonify({"ok": True})
 
-        # subscription creation via callback (existing)
         if payload.startswith("sub_"):
             link, err = generate_payment_link(cid, payload)
             if link:
@@ -357,7 +331,6 @@ def telegram_webhook():
                 tg_send_message(cid, f"❌ Error: {err}")
             return jsonify({"ok": True})
 
-        # EARN button — show referral + commission + actions (NEW)
         if payload == "earn":
             if is_subscribed(cid):
                 u = get_user(cid)
@@ -376,33 +349,27 @@ def telegram_webhook():
                 tg_send_message(cid, "🔒 Earn is for subscribed users only.")
             return jsonify({"ok": True})
 
-        # show referral link
         if payload == "ref_link":
             u = get_user(cid)
             refid = (u[7] if u else _generate_unique_referral_id())
             if not BOT_USERNAME:
                 get_bot_username()
-            bot_user = BOT_USERNAME or os.getenv("BOT_USERNAME", "")
-            if bot_user:
-                # ensure we don't include @ in the link
-                bot_user_clean = bot_user.lstrip("@")
+            bot_user_clean = (BOT_USERNAME or "").lstrip("@")
+            if bot_user_clean:
                 ref_link = f"https://t.me/{bot_user_clean}?start={refid}"
             else:
                 ref_link = f"{PUBLIC_URL.rstrip('/')}/start?ref={refid}"
-
             share_text = f"Join the Warroom: {ref_link}"
             encoded = urllib.parse.quote_plus(share_text)
-
             keyboard = kb_inline([
                 [btn("🔗 Open Link", url=ref_link)],
                 [btn("📤 Share via Telegram", url=f"https://t.me/share/url?url=&text={encoded}")],
                 [btn("🏠 Main Menu", cb="menu")]
             ])
-
-            tg_send_message(cid, f"🔗 Your referral link:\n{ref_link}\n\nShare this with friends. When they subscribe, you'll earn commission.", reply_markup=keyboard, parse_mode="Markdown")
+            tg_send_message(cid, f"🔗 Your referral link:\n{ref_link}\n\nShare this with friends. When they subscribe, you'll earn commission.",
+                            reply_markup=keyboard, parse_mode="Markdown")
             return jsonify({"ok": True})
 
-        # extend using commission - show plan choices but for extend action
         if payload == "extend":
             plans_kb = kb_inline([
                 [btn("💵 $10 / week", cb="extend_sub_10")],
@@ -413,7 +380,6 @@ def telegram_webhook():
             tg_send_message(cid, "Select a plan to extend using your commission:", reply_markup=plans_kb)
             return jsonify({"ok": True})
 
-        # handle extend_sub_ callbacks
         if payload.startswith("extend_sub_"):
             plan_key = payload.replace("extend_sub_", "sub_")
             if plan_key not in PLANS:
@@ -430,7 +396,6 @@ def telegram_webhook():
                 tg_send_message(cid, f"❌ Not enough commission. You need ${plan['amount']:.2f} but have ${comm:.2f}.")
             return jsonify({"ok": True})
 
-        # withdraw flow
         if payload == "withdraw":
             u = get_user(cid)
             comm = (u[5] if u else 0.0)
@@ -464,18 +429,34 @@ def ipn():
     plan = request.args.get("plan", "")
     days = int(request.args.get("days", 0))
 
+    # update invoice status if order_id present
+    order_id = body.get("order_id") or body.get("id") or request.args.get("order_id")
+    ipn_status = status or ""
+    if order_id:
+        try:
+            qdb("UPDATE invoices SET status=? WHERE order_id=?", (ipn_status, order_id))
+        except Exception:
+            logger.exception("Failed updating invoices table for order_id=%s", order_id)
+
     if status in ("finished", "paid", "successful") and user_id:
         plan_label = PLANS.get(plan, {}).get("label", plan or "Membership")
         plan_days = PLANS.get(plan, {}).get("days", days or 0)
         plan_amount = PLANS.get(plan, {}).get("amount", 0.0)
-        update_subscription(user_id, plan_label, plan_days)
-        tg_send_message(
-            user_id,
-            f"💥 Hey upcoming billionaire! Your {plan_label} access is active!",
-            reply_markup=kb_inline([[btn("➡️ Join Now", url=WARROOM_LINK)]])
-        )
 
-        # credit commission to referring user if present
+        # update subscription
+        update_subscription(user_id, plan_label, plan_days)
+
+        # mark invoice paid
+        if order_id:
+            try:
+                qdb("UPDATE invoices SET status='paid', amount=? WHERE order_id=?", (plan_amount, order_id))
+            except Exception:
+                logger.exception("Failed to mark invoice paid order_id=%s", order_id)
+
+        tg_send_message(user_id, f"💥 Hey upcoming billionaire! Your {plan_label} access is active!",
+                        reply_markup=kb_inline([[btn("➡️ Join Now", url=WARROOM_LINK)]]))
+
+        # credit commission if referred
         u = get_user(user_id)
         if u:
             referred_by = u[6]
@@ -483,16 +464,13 @@ def ipn():
                 ref_user = get_user_by_referral_id(referred_by)
                 if ref_user:
                     ref_user_id = ref_user[0]
-                    # commission rate set to COMMISSION_RATE (25%)
                     commission_amt = round(float(plan_amount) * COMMISSION_RATE, 2)
                     if commission_amt > 0:
                         add_commission_to_user(ref_user_id, commission_amt)
                         increment_referrals(ref_user_id)
-                        tg_send_message(
-                            ref_user_id,
-                            f"🎉 You earned a referral commission of ${commission_amt:.2f} from user @{u[1] or user_id}!\nYour new commission balance: ${get_user(ref_user_id)[5]:.2f}\nPress Earn to manage or withdraw.",
-                            reply_markup=kb_inline([[btn("💰 Earn", cb="earn")]])
-                        )
+                        tg_send_message(ref_user_id,
+                                        f"🎉 You earned a referral commission of ${commission_amt:.2f} from user @{u[1] or user_id}!\nYour new commission balance: ${get_user(ref_user_id)[5]:.2f}\nPress Earn to manage or withdraw.",
+                                        reply_markup=kb_inline([[btn("💰 Earn", cb="earn")]]))
     return jsonify({"ok": True})
 
 @app.get("/success")
@@ -501,22 +479,16 @@ def success():
     plan = request.args.get("plan", "")
     if user_id:
         plan_label = PLANS.get(plan, {}).get("label", plan or "Membership")
-        tg_send_message(
-            user_id,
-            f"💥 Hey upcoming billionaire! Your {plan_label} access is active!",
-            reply_markup=kb_inline([[btn("➡️ Join Now", url=WARROOM_LINK)]])
-        )
+        tg_send_message(user_id, f"💥 Hey upcoming billionaire! Your {plan_label} access is active!",
+                        reply_markup=kb_inline([[btn("➡️ Join Now", url=WARROOM_LINK)]]))
     return redirect(WARROOM_LINK)
 
 @app.get("/cancel")
 def cancel():
     user_id = int(request.args.get("user_id", 0))
     if user_id:
-        tg_send_message(
-            user_id,
-            "❌ Payment cancelled or timed out.",
-            reply_markup=kb_inline([[btn("🏠 Main Menu", cb="menu")]])
-        )
+        tg_send_message(user_id, "❌ Payment cancelled or timed out.",
+                        reply_markup=kb_inline([[btn("🏠 Main Menu", cb="menu")]]))
     return "<h2>Payment Cancelled</h2>", 200
 
 # ---------------- ADMIN ----------------
@@ -541,11 +513,11 @@ def admin():
         return admin_login_page("Invalid credentials")
     if not session.get("admin"):
         return admin_login_page()
-    # dashboard links to three sections
     return """
     <html><head><title>Admin Dashboard</title></head><body>
     <h2>Admin Dashboard</h2>
     <ul>
+      <li><a href="/admin/invoices">Invoices (Payments)</a></li>
       <li><a href="/admin/payouts">Payout Requests</a></li>
       <li><a href="/admin/subscribers">Subscribed Users</a></li>
       <li><a href="/admin/referrals">Referral Tracker</a></li>
@@ -559,14 +531,54 @@ def admin_logout():
     session.pop("admin", None)
     return redirect("/admin")
 
-# Payouts: view pending withdrawals, mark processed
+@app.route("/admin/invoices", methods=["GET", "POST"])
+def admin_invoices():
+    if not session.get("admin"):
+        return admin_login_page()
+    msg = ""
+    if request.method == "POST":
+        invoice_id = int(request.form.get("invoice_id", 0) or 0)
+        action = request.form.get("action", "")
+        if invoice_id and action == "activate":
+            row = qdb("SELECT order_id, user_id, plan_key, amount FROM invoices WHERE id=?", (invoice_id,), one=True)
+            if row:
+                order_id, uid, plan_key, amt = row
+                plan = PLANS.get(plan_key) if plan_key else None
+                if plan:
+                    update_subscription(uid, plan["label"], plan["days"])
+                qdb("UPDATE invoices SET status='admin_activated' WHERE id=?", (invoice_id,))
+                try:
+                    tg_send_message(uid, f"🔔 Admin activated your subscription. Enjoy!", reply_markup=kb_inline([[btn("➡️ Join Now", url=WARROOM_LINK)]]))
+                except Exception:
+                    logger.exception("Failed to notify user after admin activation")
+                msg = "Invoice activated and user notified."
+        if request.method == "POST" and request.form.get("mark_processed"):
+            invoice_id = int(request.form.get("mark_processed", 0) or 0)
+            if invoice_id:
+                qdb("UPDATE invoices SET status='processed' WHERE id=?", (invoice_id,))
+                msg = "Marked processed."
+
+    rows = qdb("SELECT i.id, i.order_id, i.user_id, i.plan_key, i.amount, i.status, i.created_at, u.username FROM invoices i LEFT JOIN users u ON u.user_id = i.user_id ORDER BY i.created_at DESC")
+    html = "<h2>Invoices / Payments</h2>"
+    if msg:
+        html += f"<p style='color:green'>{escape(msg)}</p>"
+    html += "<table border=1 cellpadding=6><tr><th>ID</th><th>Order ID</th><th>User</th><th>Plan</th><th>Amount</th><th>Status</th><th>Created</th><th>Actions</th></tr>"
+    for r in rows:
+        inv_id, order_id, uid, plan_key, amt, status, created, uname = r
+        html += f"<tr><td>{inv_id}</td><td>{escape(str(order_id) or '')}</td><td>{escape(uname or '')} ({uid})</td><td>{escape(plan_key or '')}</td><td>${(amt or 0):.2f}</td><td>{escape(status or '')}</td><td>{created}</td>"
+        html += "<td>"
+        html += f"<form method='post' style='display:inline'><input type='hidden' name='invoice_id' value='{inv_id}'/><input type='hidden' name='action' value='activate'/><button>Activate</button></form> "
+        html += f"<form method='post' style='display:inline'><button name='mark_processed' value='{inv_id}'>Mark Processed</button></form>"
+        html += "</td></tr>"
+    html += "</table><p><a href='/admin'>Back</a></p>"
+    return html
+
 @app.route("/admin/payouts", methods=["GET", "POST"])
 def admin_payouts():
     if not session.get("admin"):
         return admin_login_page()
     if request.method == "POST":
-        # mark payout processed
-        wid = int(request.form.get("withdrawal_id", 0))
+        wid = int(request.form.get("withdrawal_id", 0) or 0)
         if wid:
             mark_withdrawal_processed(wid)
     rows = qdb("SELECT w.id, w.user_id, w.amount, w.sol_address, w.status, w.created_at, u.username FROM withdrawals w LEFT JOIN users u ON u.user_id = w.user_id ORDER BY w.created_at DESC")
@@ -581,44 +593,50 @@ def admin_payouts():
     html += "</table><p><a href='/admin'>Back</a></p>"
     return html
 
-# Subscribers: list subscribed users and allow admin to activate/extend
 @app.route("/admin/subscribers", methods=["GET", "POST"])
 def admin_subscribers():
     if not session.get("admin"):
         return admin_login_page()
     message = ""
     if request.method == "POST":
-        # activation form: user_id and plan_key
-        uid = int(request.form.get("user_id", 0))
+        uid = int(request.form.get("user_id", 0) or 0)
         plan_key = request.form.get("plan_key", "")
         if uid and plan_key in PLANS:
             plan = PLANS[plan_key]
             update_subscription(uid, plan["label"], plan["days"])
-            # notify user
             try:
                 tg_send_message(uid, f"🔔 Admin has activated/extended your subscription: {plan['label']} ({plan['days']} days). Enjoy!", reply_markup=kb_inline([[btn("➡️ Join Now", url=WARROOM_LINK)]]))
             except Exception:
                 logger.exception("Failed to send activation message")
             message = "Subscription updated and user notified."
-    # list users (all) showing subscription_end and commission
-    rows = qdb("SELECT user_id, username, subscription_plan, subscription_end, commission FROM users ORDER BY subscription_end DESC NULLS LAST")
+
+        remove_uid = int(request.form.get("remove_user_id", 0) or 0)
+        if remove_uid:
+            qdb("DELETE FROM users WHERE user_id=?", (remove_uid,))
+            message = f"User {remove_uid} removed."
+
+    rows = qdb("SELECT user_id, username, subscription_plan, subscription_end, commission, referral_id FROM users ORDER BY subscription_end DESC")
     html = "<h2>Subscribed Users / All Users</h2>"
     if message:
         html += f"<p style='color:green'>{escape(message)}</p>"
-    html += "<table border=1 cellpadding=4><tr><th>User ID</th><th>Username</th><th>Plan</th><th>Ends</th><th>Commission</th><th>Activate/Extend</th></tr>"
+    html += "<table border=1 cellpadding=4><tr><th>User ID</th><th>Username</th><th>Plan</th><th>Ends</th><th>Commission</th><th>Referral ID</th><th>Actions</th></tr>"
     for r in rows:
-        html += f"<tr><td>{r[0]}</td><td>{escape(r[1] or '')}</td><td>{escape(r[2] or '')}</td><td>{r[3] or '—'}</td><td>${(r[4] or 0):.2f}</td>"
-        # Activation form
-        html += "<td><form method='post'>"
-        html += f"<input type='hidden' name='user_id' value='{r[0]}'/>"
+        uid = r[0]
+        html += f"<tr><td>{uid}</td><td>{escape(r[1] or '')}</td><td>{escape(r[2] or '')}</td><td>{r[3] or '—'}</td><td>${(r[4] or 0):.2f}</td><td>{escape(r[5] or '')}</td>"
+        html += "<td>"
+        html += "<form method='post' style='display:inline'>"
+        html += f"<input type='hidden' name='user_id' value='{uid}'/>"
         html += "<select name='plan_key'>"
         for pk, p in PLANS.items():
             html += f"<option value='{pk}'>{p['label']} - ${p['amount']} ({p['days']}d)</option>"
-        html += "</select> <button>Activate/Extend</button></form></td></tr>"
+        html += "</select> <button>Activate/Extend</button></form> "
+        html += f"<form method='post' style='display:inline;margin-left:8px'>"
+        html += f"<input type='hidden' name='remove_user_id' value='{uid}'/>"
+        html += "<button style='background:#c33;color:#fff'>Remove</button></form>"
+        html += "</td></tr>"
     html += "</table><p><a href='/admin'>Back</a></p>"
     return html
 
-# Referral tracker: shows users and referral stats
 @app.route("/admin/referrals")
 def admin_referrals():
     if not session.get("admin"):
@@ -630,7 +648,7 @@ def admin_referrals():
     html += "</table><p><a href='/admin'>Back</a></p>"
     return html
 
-# ---------------- BOOTSTRAP ON IMPORT ----------------
+# ---------------- BOOTSTRAP ----------------
 def _bootstrap():
     try:
         init_db()
@@ -645,7 +663,7 @@ def _bootstrap():
     except Exception:
         logger.exception("Webhook init failed")
 
-_bootstrap()  # works with gunicorn final_bot1:app
+_bootstrap()
 
 # ---------------- DEV ----------------
 if __name__ == "__main__":
